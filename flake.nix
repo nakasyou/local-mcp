@@ -9,6 +9,8 @@
       supportedSystems = [
         "x86_64-linux"
         "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
       ];
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
     in
@@ -36,11 +38,13 @@
             postInstall = ''
               wrapProgram $out/bin/local-mcp \
                 --prefix PATH : ${
-                  pkgs.lib.makeBinPath [
-                    pkgs.bash
-                    pkgs.bubblewrap
-                    pkgs.curl
-                  ]
+                  pkgs.lib.makeBinPath (
+                    [
+                      pkgs.bash
+                      pkgs.curl
+                    ]
+                    ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.bubblewrap ]
+                  )
                 }
             '';
 
@@ -71,7 +75,6 @@
         {
           default = pkgs.mkShell {
             packages = with pkgs; [
-              bubblewrap
               cargo
               cmake
               curl
@@ -80,7 +83,7 @@
               pkg-config
               rustc
               rustfmt
-            ];
+            ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.bubblewrap ];
           };
         }
       );

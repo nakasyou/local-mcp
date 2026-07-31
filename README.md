@@ -5,8 +5,9 @@ image reads, directory listings, sandboxed file writes and commands, plus explic
 unsandboxed command execution. It intentionally does not provide web search or a
 dedicated network-request tool.
 
-Commands are isolated with OpenAI Codex's `codex-rs/sandboxing` and Linux sandbox
-helper. Network access is denied for ordinary commands.
+Commands are isolated with OpenAI Codex's `codex-rs/sandboxing`: Landlock and the
+Linux sandbox helper on Linux, and Seatbelt (`sandbox-exec`) on macOS. Network
+access is denied for ordinary commands.
 
 ## Usage
 
@@ -38,7 +39,8 @@ local-mcp start my-project
 /permission status
 ```
 
-With Nix, `bwrap`, `curl`, and `bash` are included in the runtime environment:
+With Nix, `curl` and `bash` are included in the runtime environment. Linux builds
+also include `bwrap`:
 
 ```sh
 nix run github:OWNER/local-mcp
@@ -73,6 +75,7 @@ to check for completion or `stop_job` to terminate them. Use `start_command`
 when a command should run in the background immediately without the 30-second
 foreground wait.
 
-The build produces `local-mcp` and its sibling `codex-linux-sandbox`; install or
-copy both into the same directory. On Linux, `bwrap` (bubblewrap) must be
-available in `PATH`. macOS/Windows support is not implemented yet.
+On Linux, the build produces `local-mcp` and its sibling `codex-linux-sandbox`;
+install or copy both into the same directory, and ensure `bwrap` (bubblewrap) is
+available in `PATH`. On macOS, only `local-mcp` is needed; sandboxed commands use
+the system `/usr/bin/sandbox-exec`. Windows support is not implemented yet.

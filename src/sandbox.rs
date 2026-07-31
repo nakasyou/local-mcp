@@ -70,9 +70,30 @@ pub async fn run(
         process
     };
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let mut process = {
+        use codex_sandboxing::seatbelt::CreateSeatbeltCommandArgsParams;
+        use codex_sandboxing::seatbelt::MACOS_PATH_TO_SEATBELT_EXECUTABLE;
+        use codex_sandboxing::seatbelt::create_seatbelt_command_args;
+
+        let (file_system_policy, network_policy) = permissions.to_runtime_permissions();
+        let args = create_seatbelt_command_args(CreateSeatbeltCommandArgsParams {
+            command: command.to_vec(),
+            file_system_sandbox_policy: &file_system_policy,
+            network_sandbox_policy: network_policy,
+            sandbox_policy_cwd: &cwd,
+            enforce_managed_network: false,
+            network: None,
+            extra_allow_unix_sockets: &[],
+        });
+        let mut process = Command::new(MACOS_PATH_TO_SEATBELT_EXECUTABLE);
+        process.args(args);
+        process
+    };
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let mut process =
-        { anyhow::bail!("sandboxed execution is currently implemented for Linux only") };
+        { anyhow::bail!("sandboxed execution is currently implemented for Linux and macOS only") };
 
     process
         .kill_on_drop(true)
@@ -147,4 +168,80 @@ fn safe_environment() -> HashMap<String, String> {
                 .map(|value| (name.to_owned(), value))
         })
         .collect()
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn test_directory() -> PathBuf {
+        std::env::temp_dir().join(format!("local-mcp-sandbox-test-{}", Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn seatbelt_allows_workspace_writes_and_denies_other_writes() -> Result<()> {
+        // Nix's macOS build sandbox does not allow a nested Seatbelt profile.
+        if std::env::var_os("NIX_BUILD_TOP").is_some() {
+            return Ok(());
+        }
+        let root = test_directory();
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::create_dir_all(&outside)?;
+
+        let allowed = run(
+            &["/usr/bin/touch".into(), "allowed".into()],
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+        assert_eq!(allowed.status, 0, "{}", allowed.stderr);
+        assert!(workspace.join("allowed").is_file());
+
+        let denied_path = outside.join("denied");
+        let denied = run(
+            &[
+                "/usr/bin/touch".into(),
+                denied_path.to_string_lossy().into_owned(),
+            ],
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+        assert_ne!(denied.status, 0);
+        assert!(!denied_path.exists());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seatbelt_denies_network_access() -> Result<()> {
+        if std::env::var_os("NIX_BUILD_TOP").is_some() {
+            return Ok(());
+        }
+        let workspace = test_directory();
+        std::fs::create_dir_all(&workspace)?;
+        let output = run(
+            &[
+                "/usr/bin/curl".into(),
+                "--fail".into(),
+                "--max-time".into(),
+                "2".into(),
+                "https://example.com".into(),
+            ],
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+        assert_ne!(output.status, 0);
+
+        std::fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
 }
