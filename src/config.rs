@@ -34,7 +34,7 @@ pub fn socket_path(id: &str) -> Result<PathBuf> {
 /// Socket paths have a platform-specific length limit (104 bytes on macOS),
 /// so they cannot live below the regular state directory, which may include
 /// a long home-directory path. Session metadata remains in `state_dir()`.
-pub fn socket_dir() -> PathBuf {
+fn socket_dir() -> PathBuf {
     // `TMPDIR` on macOS can itself be long, so use the conventional short
     // system temporary directory rather than `std::env::temp_dir()`.
     let uid = unsafe { libc::geteuid() };
