@@ -62,9 +62,10 @@ sessions.
 `get_image` returns PNG, JPEG, GIF, WebP, BMP, TIFF, and AVIF files as native MCP
 image content. Relative image paths are resolved from the session working directory.
 
-Each session uses its own permission-restricted local IPC endpoint (a Unix domain socket on Unix and a named pipe on Windows). Both the MCP
-server and the start UI block on I/O, so idle operation and pending approvals
-do not use polling timers.
+Each session uses its own local IPC endpoint: an explicitly permission-restricted
+Unix domain socket on Unix, or a named pipe using Windows' default security
+descriptor. Both the MCP server and the start UI block on I/O, so idle operation
+and pending approvals do not use polling timers.
 
 The `start` screen also receives live activity from MCP calls. It shows file and
 image reads, directory listings, file edits with unified diffs and line counts,
@@ -81,7 +82,12 @@ available in `PATH`. On macOS, only `local-mcp` is needed; sandboxed commands us
 the system `/usr/bin/sandbox-exec`. Windows uses named-pipe IPC and direct argv
 execution; it does not currently provide the filesystem/network sandbox enforced
 by Linux and macOS. Consequently, `execute` and `start_command` require approval
-on Windows unless the session is in yolo mode. Windows builds use the MSVC Rust
-target and require Visual Studio Build Tools with the "Desktop development with
-C++" workload. Build from a Developer PowerShell with
+on Windows unless the session is in yolo mode, while `write_file` writes directly
+to the requested host path. The Windows named pipe uses the
+[default security descriptor](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights),
+which grants full control to LocalSystem, administrators, and the creator owner,
+and read access to Everyone and anonymous users; unlike Unix, `local-mcp` does not
+install an explicit per-user ACL. Windows builds use the MSVC Rust target and
+require Visual Studio Build Tools with the "Desktop development with C++"
+workload. Build from a Developer PowerShell with
 `cargo build --locked --release`.

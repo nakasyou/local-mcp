@@ -52,6 +52,9 @@ impl SessionListener {
 fn new_pipe(path: &Path, first: bool) -> Result<NamedPipeServer> {
     let mut options = ServerOptions::new();
     options.first_pipe_instance(first);
+    // Tokio creates the pipe with a null SECURITY_ATTRIBUTES pointer, so the
+    // Windows default security descriptor applies. This is documented in the
+    // README rather than presented as equivalent to Unix's explicit 0600 mode.
     Ok(options.create(path)?)
 }
 
