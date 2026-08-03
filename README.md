@@ -62,7 +62,7 @@ sessions.
 `get_image` returns PNG, JPEG, GIF, WebP, BMP, TIFF, and AVIF files as native MCP
 image content. Relative image paths are resolved from the session working directory.
 
-Each session uses its own permission-restricted Unix domain socket. Both the MCP
+Each session uses its own permission-restricted local IPC endpoint (a Unix domain socket on Unix and a named pipe on Windows). Both the MCP
 server and the start UI block on I/O, so idle operation and pending approvals
 do not use polling timers.
 
@@ -78,4 +78,8 @@ foreground wait.
 On Linux, the build produces `local-mcp` and its sibling `codex-linux-sandbox`;
 install or copy both into the same directory, and ensure `bwrap` (bubblewrap) is
 available in `PATH`. On macOS, only `local-mcp` is needed; sandboxed commands use
-the system `/usr/bin/sandbox-exec`. Windows support is not implemented yet.
+the system `/usr/bin/sandbox-exec`. Windows uses named-pipe IPC and direct argv
+execution; it does not currently provide the filesystem/network sandbox enforced
+by Linux and macOS. Windows builds use the MSVC Rust target and require Visual
+Studio Build Tools with the "Desktop development with C++" workload. Build from
+a Developer PowerShell with `cargo build --locked --release`.

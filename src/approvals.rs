@@ -1,15 +1,77 @@
 use std::collections::VecDeque;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
 
 use crate::config::{self, Session};
+
+trait SessionIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> SessionIo for T {}
+type SessionStream = Box<dyn SessionIo>;
+
+#[cfg(unix)]
+struct SessionListener(UnixListener);
+#[cfg(windows)]
+struct SessionListener {
+    path: PathBuf,
+    server: NamedPipeServer,
+}
+
+impl SessionListener {
+    async fn accept(&mut self) -> Result<SessionStream> {
+        #[cfg(unix)]
+        {
+            return Ok(Box::new(self.0.accept().await?.0));
+        }
+        #[cfg(windows)]
+        {
+            let server = std::mem::replace(&mut self.server, new_pipe(&self.path, false)?);
+            server.connect().await?;
+            return Ok(Box::new(server));
+        }
+    }
+}
+
+#[cfg(windows)]
+fn new_pipe(path: &PathBuf, first: bool) -> Result<NamedPipeServer> {
+    let mut options = ServerOptions::new();
+    options.first_pipe_instance(first);
+    Ok(options.create(path)?)
+}
+
+async fn connect(path: &PathBuf) -> Result<SessionStream> {
+    #[cfg(unix)]
+    {
+        Ok(Box::new(UnixStream::connect(path).await?))
+    }
+    #[cfg(windows)]
+    {
+        Ok(Box::new(ClientOptions::new().open(path)?))
+    }
+}
+
+#[cfg(unix)]
+fn bind_listener(path: &PathBuf) -> Result<SessionListener> {
+    Ok(SessionListener(UnixListener::bind(path)?))
+}
+
+#[cfg(windows)]
+fn bind_listener(path: &PathBuf) -> Result<SessionListener> {
+    Ok(SessionListener {
+        path: path.clone(),
+        server: new_pipe(path, true)?,
+    })
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct Request {
@@ -44,7 +106,7 @@ pub async fn request(
         cwd,
     };
     let path = config::socket_path(session_id)?;
-    let mut stream = UnixStream::connect(&path)
+    let mut stream = connect(&path)
         .await
         .with_context(|| format!("session {session_id} is not running; run `local-mcp start`"))?;
     stream
@@ -69,7 +131,7 @@ pub async fn activity(session_id: &str, title: impl Into<String>, detail: Option
     let Ok(path) = config::socket_path(session_id) else {
         return;
     };
-    let Ok(mut stream) = UnixStream::connect(path).await else {
+    let Ok(mut stream) = connect(&path).await else {
         return;
     };
     let message = Message::Activity {
@@ -87,13 +149,17 @@ pub async fn activity(session_id: &str, title: impl Into<String>, detail: Option
 pub async fn start(session_id: Option<&str>) -> Result<()> {
     let mut session = config::create_session(&std::env::current_dir()?, session_id).await?;
     let path = config::socket_path(&session.id)?;
-    let state_dir = path.parent().context("session socket has no parent")?;
-    tokio::fs::create_dir_all(state_dir).await?;
-    tokio::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).await?;
+    #[cfg(unix)]
+    {
+        let state_dir = path.parent().context("session socket has no parent")?;
+        tokio::fs::create_dir_all(state_dir).await?;
+        tokio::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).await?;
+    }
     remove_stale_socket(&path).await?;
 
-    let listener = UnixListener::bind(&path)
-        .with_context(|| format!("failed to listen at {}", path.display()))?;
+    let mut listener =
+        bind_listener(&path).with_context(|| format!("failed to listen at {}", path.display()))?;
+    #[cfg(unix)]
     tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
     eprintln!(
         "local-mcp session: {}\ncwd: {}\n\
@@ -105,12 +171,12 @@ pub async fn start(session_id: Option<&str>) -> Result<()> {
     );
 
     let mut input = BufReader::new(tokio::io::stdin()).lines();
-    let mut pending = VecDeque::<(Request, UnixStream)>::new();
+    let mut pending = VecDeque::<(Request, SessionStream)>::new();
     let mut yolo = false;
     loop {
         tokio::select! {
             connection = listener.accept() => {
-                let (mut stream, _) = connection?;
+                let mut stream = connection?;
                 let mut line = String::new();
                 BufReader::new(&mut stream).read_line(&mut line).await?;
                 let message: Message = serde_json::from_str(&line).context("invalid session message")?;
@@ -143,6 +209,7 @@ fn show_activity(title: &str, detail: Option<&str>) {
     }
 }
 
+#[cfg(unix)]
 async fn remove_stale_socket(path: &PathBuf) -> Result<()> {
     match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
@@ -151,11 +218,16 @@ async fn remove_stale_socket(path: &PathBuf) -> Result<()> {
     }
 }
 
+#[cfg(windows)]
+async fn remove_stale_socket(_path: &PathBuf) -> Result<()> {
+    Ok(())
+}
+
 async fn handle_input(
     input: &str,
     session: &mut Session,
     yolo: &mut bool,
-    pending: &mut VecDeque<(Request, UnixStream)>,
+    pending: &mut VecDeque<(Request, SessionStream)>,
 ) -> Result<()> {
     match input {
         "/permissions yolo" | "/permission yolo" => {
@@ -256,7 +328,7 @@ fn show_request(request: &Request) -> Result<()> {
     Ok(())
 }
 
-fn show_next(pending: &VecDeque<(Request, UnixStream)>) -> Result<()> {
+fn show_next(pending: &VecDeque<(Request, SessionStream)>) -> Result<()> {
     if let Some((request, _)) = pending.front() {
         show_request(request)?;
     }

@@ -294,20 +294,34 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
     let previous = tokio::fs::read_to_string(&absolute)
         .await
         .unwrap_or_default();
-    let command = vec![
-        "sh".to_owned(),
-        "-c".to_owned(),
-        "cat > \"$1\"".to_owned(),
-        "local-mcp-write".to_owned(),
-        absolute.display().to_string(),
-    ];
-    let output = sandbox::run(
-        &command,
-        &parent,
-        &[parent.clone()],
-        Some(content.as_bytes()),
-    )
-    .await?;
+    #[cfg(unix)]
+    let output = {
+        let command = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "cat > \"$1\"".to_owned(),
+            "local-mcp-write".to_owned(),
+            absolute.display().to_string(),
+        ];
+        sandbox::run(
+            &command,
+            &parent,
+            std::slice::from_ref(&parent),
+            Some(content.as_bytes()),
+        )
+        .await?
+    };
+    #[cfg(windows)]
+    let output = {
+        // Windows has no application sandbox here, so avoid depending on a
+        // shell utility for the atomic file-edit operation.
+        tokio::fs::write(&absolute, content).await?;
+        sandbox::Output {
+            status: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    };
     let result = render_output(output);
     let (added, removed, diff) = render_diff(&previous, content);
     let title = format!(

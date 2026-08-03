@@ -26,7 +26,7 @@ pub fn session_path(id: &str) -> Result<PathBuf> {
 
 pub fn socket_path(id: &str) -> Result<PathBuf> {
     validate_session_id(id)?;
-    Ok(socket_dir().join(format!("{id}.sock")))
+    Ok(socket_path_for_id(id))
 }
 
 /// Returns a short, per-user directory for Unix-domain session sockets.
@@ -34,11 +34,22 @@ pub fn socket_path(id: &str) -> Result<PathBuf> {
 /// Socket paths have a platform-specific length limit (104 bytes on macOS),
 /// so they cannot live below the regular state directory, which may include
 /// a long home-directory path. Session metadata remains in `state_dir()`.
+#[cfg(unix)]
 fn socket_dir() -> PathBuf {
     // `TMPDIR` on macOS can itself be long, so use the conventional short
     // system temporary directory rather than `std::env::temp_dir()`.
     let uid = unsafe { libc::geteuid() };
     PathBuf::from("/tmp").join(format!("local-mcp-{uid}"))
+}
+
+#[cfg(unix)]
+fn socket_path_for_id(id: &str) -> PathBuf {
+    socket_dir().join(format!("{id}.sock"))
+}
+
+#[cfg(windows)]
+fn socket_path_for_id(id: &str) -> PathBuf {
+    PathBuf::from(format!(r"\\.\pipe\local-mcp-{id}"))
 }
 
 pub async fn create_session(cwd: &Path, id: Option<&str>) -> Result<Session> {
@@ -105,10 +116,21 @@ mod tests {
         assert!(validate_session_id(&"x".repeat(65)).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn puts_sockets_in_a_short_per_user_directory() {
         let path = socket_path("7418eda5-fd07-4e00-ace5-c1ece2f68a02").unwrap();
         assert_eq!(path.parent(), Some(socket_dir().as_path()));
         assert!(path.as_os_str().len() < 104);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uses_a_named_pipe_for_session_ipc() {
+        let path = socket_path("7418eda5-fd07-4e00-ace5-c1ece2f68a02").unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from(r"\\.\pipe\local-mcp-7418eda5-fd07-4e00-ace5-c1ece2f68a02")
+        );
     }
 }

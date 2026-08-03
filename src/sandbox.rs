@@ -91,9 +91,19 @@ pub async fn run(
         process
     };
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let mut process =
-        { anyhow::bail!("sandboxed execution is currently implemented for Linux and macOS only") };
+    #[cfg(windows)]
+    let mut process = {
+        // Windows has no equivalent of Landlock/Seatbelt in this application.
+        // Preserve argv execution and the restricted environment so the
+        // feature remains usable, while documenting that this is not a
+        // filesystem/network sandbox.
+        let mut process = Command::new(&command[0]);
+        process.args(&command[1..]);
+        process
+    };
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let mut process = { anyhow::bail!("sandboxed execution is unsupported on this platform") };
 
     process
         .kill_on_drop(true)
@@ -160,14 +170,23 @@ pub async fn run_unrestricted(
 }
 
 fn safe_environment() -> HashMap<String, String> {
-    ["PATH", "LANG", "LC_ALL", "TERM", "TMPDIR"]
-        .into_iter()
-        .filter_map(|name| {
-            std::env::var(name)
-                .ok()
-                .map(|value| (name.to_owned(), value))
-        })
-        .collect()
+    [
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "SystemRoot",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| (name.to_owned(), value))
+    })
+    .collect()
 }
 
 #[cfg(all(test, target_os = "macos"))]
