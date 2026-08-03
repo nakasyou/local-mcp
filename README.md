@@ -80,6 +80,8 @@ install or copy both into the same directory, and ensure `bwrap` (bubblewrap) is
 available in `PATH`. On macOS, only `local-mcp` is needed; sandboxed commands use
 the system `/usr/bin/sandbox-exec`. Windows uses named-pipe IPC and direct argv
 execution; it does not currently provide the filesystem/network sandbox enforced
-by Linux and macOS. Windows builds use the MSVC Rust target and require Visual
-Studio Build Tools with the "Desktop development with C++" workload. Build from
-a Developer PowerShell with `cargo build --locked --release`.
+by Linux and macOS. Consequently, `execute` and `start_command` require approval
+on Windows unless the session is in yolo mode. Windows builds use the MSVC Rust
+target and require Visual Studio Build Tools with the "Desktop development with
+C++" workload. Build from a Developer PowerShell with
+`cargo build --locked --release`.

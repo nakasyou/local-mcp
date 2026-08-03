@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -11,6 +13,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 use crate::config::{self, Session};
@@ -35,40 +39,58 @@ impl SessionListener {
         }
         #[cfg(windows)]
         {
+            // Keep the connecting instance in listener state while awaiting so
+            // cancelling this future from `tokio::select!` cannot drop it.
+            self.server.connect().await?;
             let server = std::mem::replace(&mut self.server, new_pipe(&self.path, false)?);
-            server.connect().await?;
             return Ok(Box::new(server));
         }
     }
 }
 
 #[cfg(windows)]
-fn new_pipe(path: &PathBuf, first: bool) -> Result<NamedPipeServer> {
+fn new_pipe(path: &Path, first: bool) -> Result<NamedPipeServer> {
     let mut options = ServerOptions::new();
     options.first_pipe_instance(first);
     Ok(options.create(path)?)
 }
 
-async fn connect(path: &PathBuf) -> Result<SessionStream> {
+async fn connect(path: &Path) -> Result<SessionStream> {
     #[cfg(unix)]
     {
         Ok(Box::new(UnixStream::connect(path).await?))
     }
     #[cfg(windows)]
     {
-        Ok(Box::new(ClientOptions::new().open(path)?))
+        const ERROR_PIPE_BUSY: i32 = 231;
+        const RETRY_DELAY: Duration = Duration::from_millis(10);
+        const RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let deadline = Instant::now() + RETRY_TIMEOUT;
+        loop {
+            match ClientOptions::new().open(path) {
+                Ok(client) => return Ok(Box::new(client)),
+                Err(error)
+                    if error.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                        && Instant::now() < deadline =>
+                {
+                    sleep(RETRY_DELAY).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 }
 
 #[cfg(unix)]
-fn bind_listener(path: &PathBuf) -> Result<SessionListener> {
+fn bind_listener(path: &Path) -> Result<SessionListener> {
     Ok(SessionListener(UnixListener::bind(path)?))
 }
 
 #[cfg(windows)]
-fn bind_listener(path: &PathBuf) -> Result<SessionListener> {
+fn bind_listener(path: &Path) -> Result<SessionListener> {
     Ok(SessionListener {
-        path: path.clone(),
+        path: path.to_owned(),
         server: new_pipe(path, true)?,
     })
 }
@@ -333,4 +355,45 @@ fn show_next(pending: &VecDeque<(Request, SessionStream)>) -> Result<()> {
         show_request(request)?;
     }
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use tokio::time::timeout;
+
+    fn pipe_path() -> PathBuf {
+        PathBuf::from(format!(r"\\.\pipe\local-mcp-test-{}", Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn cancelling_accept_preserves_the_pipe_server() -> Result<()> {
+        let path = pipe_path();
+        let mut listener = bind_listener(&path)?;
+
+        assert!(
+            timeout(Duration::from_millis(10), listener.accept())
+                .await
+                .is_err()
+        );
+        let _client = ClientOptions::new().open(&path)?;
+        let _server = timeout(Duration::from_secs(1), listener.accept()).await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connecting_retries_while_all_pipe_instances_are_busy() -> Result<()> {
+        let path = pipe_path();
+        let mut listener = bind_listener(&path)?;
+        let _first_client = ClientOptions::new().open(&path)?;
+
+        let client_path = path.clone();
+        let waiting_client = tokio::spawn(async move { connect(&client_path).await });
+        sleep(Duration::from_millis(50)).await;
+        let _first_server = listener.accept().await?;
+        let _second_client = timeout(Duration::from_secs(1), waiting_client).await???;
+
+        Ok(())
+    }
 }
