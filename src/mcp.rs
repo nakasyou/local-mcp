@@ -1,9 +1,15 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use axum::Router;
+use axum::body::Bytes;
+use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
@@ -14,6 +20,7 @@ use uuid::Uuid;
 use crate::{approvals, config, sandbox};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
+const PROTOCOL_VERSION: &str = "2025-06-18";
 
 struct Job {
     session_id: String,
@@ -40,19 +47,142 @@ pub async fn serve() -> Result<()> {
                 continue;
             }
         };
-        if request.get("id").is_none() {
-            continue;
+        if let Some(response) = handle_request(&request).await {
+            write_message(&mut stdout, &response).await?;
         }
-        let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let response = match dispatch(&request).await {
-            Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
-            Err(error) => {
-                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":format!("{error:#}")}})
-            }
-        };
-        write_message(&mut stdout, &response).await?;
     }
     Ok(())
+}
+
+pub async fn serve_http(bind: SocketAddr) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("failed to bind HTTP server to {bind}"))?;
+    eprintln!("local-mcp HTTP server listening on http://{bind}/mcp");
+    axum::serve(
+        listener,
+        Router::new().route("/mcp", post(http_post).get(http_get).delete(http_get)),
+    )
+    .await
+    .context("HTTP server failed")
+}
+
+async fn http_get(headers: HeaderMap) -> Response {
+    if !has_valid_origin(&headers) {
+        return (StatusCode::FORBIDDEN, "Origin is not allowed").into_response();
+    }
+    StatusCode::METHOD_NOT_ALLOWED.into_response()
+}
+
+async fn http_post(headers: HeaderMap, body: Bytes) -> Response {
+    if !has_valid_origin(&headers) {
+        return (StatusCode::FORBIDDEN, "Origin is not allowed").into_response();
+    }
+    if !is_json_content_type(&headers) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type must be application/json",
+        )
+            .into_response();
+    }
+    if !accepts_json(&headers) {
+        return (
+            StatusCode::NOT_ACCEPTABLE,
+            "Accept must include application/json and text/event-stream",
+        )
+            .into_response();
+    }
+
+    let request: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {"code": -32700, "message": error.to_string()}
+            }));
+        }
+    };
+    if !has_supported_protocol_version(&headers, &request) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("unsupported MCP-Protocol-Version; expected {PROTOCOL_VERSION}"),
+        )
+            .into_response();
+    }
+    match handle_request(&request).await {
+        Some(response) => json_response(response),
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+}
+
+fn has_valid_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    origin
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<Uri>().ok())
+        .and_then(|uri| uri.host().map(str::to_owned))
+        .is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || matches!(host.as_str(), "127.0.0.1" | "::1" | "[::1]")
+        })
+}
+
+fn has_supported_protocol_version(headers: &HeaderMap, request: &Value) -> bool {
+    if request.get("method").and_then(Value::as_str) == Some("initialize") {
+        return true;
+    }
+    headers
+        .get("mcp-protocol-version")
+        .map(|value| value.as_bytes() == PROTOCOL_VERSION.as_bytes())
+        .unwrap_or(true)
+}
+
+fn accepts_json(headers: &HeaderMap) -> bool {
+    let Some(value) = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let accepts = |expected: &str| {
+        value.split(',').any(|item| {
+            item.trim()
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.eq_ignore_ascii_case(expected) || mime == "*/*")
+        })
+    };
+    accepts("application/json") && accepts("text/event-stream")
+}
+
+fn json_response(value: Value) -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        value.to_string(),
+    )
+        .into_response()
+}
+
+async fn handle_request(request: &Value) -> Option<Value> {
+    let id = request.get("id")?.clone();
+    Some(match dispatch(request).await {
+        Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
+        Err(error) => {
+            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":format!("{error:#}")}})
+        }
+    })
 }
 
 async fn write_message(stdout: &mut tokio::io::Stdout, message: &Value) -> Result<()> {
@@ -71,7 +201,7 @@ async fn dispatch(request: &Value) -> Result<Value> {
         .unwrap_or_default()
     {
         "initialize" => Ok(json!({
-            "protocolVersion": "2025-06-18",
+            "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": false}},
             "serverInfo": {"name": "local-mcp", "version": env!("CARGO_PKG_VERSION")},
             "instructions": "Every tool call requires the local-mcp session_id supplied by the user. Call session_info with that ID to inspect its working directory and sandbox roots."
@@ -564,6 +694,16 @@ fn render_output(output: sandbox::Output) -> Result<String> {
 mod tests {
     use super::*;
 
+    fn http_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(
+            header::ACCEPT,
+            "application/json, text/event-stream".parse().unwrap(),
+        );
+        headers
+    }
+
     #[test]
     fn detects_supported_image_types() {
         assert_eq!(image_mime_type(b"\x89PNG\r\n\x1a\n"), Some("image/png"));
@@ -616,5 +756,69 @@ mod tests {
         tokio::fs::remove_dir_all(directory).await.unwrap();
 
         assert_eq!(result["content"][0]["mimeType"], "image/gif");
+    }
+
+    #[tokio::test]
+    async fn http_returns_json_rpc_response() {
+        let response = http_post(
+            http_headers(),
+            Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["id"], 1);
+        assert_eq!(body["result"]["serverInfo"]["name"], "local-mcp");
+    }
+
+    #[tokio::test]
+    async fn http_accepts_notifications_without_a_response_body() {
+        let response = http_post(
+            http_headers(),
+            Bytes::from_static(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_rejects_invalid_headers() {
+        let response = http_post(HeaderMap::new(), Bytes::from_static(b"{}")).await;
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let mut headers = http_headers();
+        headers.insert(header::ORIGIN, "https://example.com".parse().unwrap());
+        let response = http_post(headers, Bytes::from_static(b"{}")).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let mut headers = http_headers();
+        headers.insert("mcp-protocol-version", "unsupported".parse().unwrap());
+        let response = http_post(
+            headers,
+            Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_get_reports_that_sse_is_not_available() {
+        let response = http_get(HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, "https://example.com".parse().unwrap());
+        let response = http_get(headers).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

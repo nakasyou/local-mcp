@@ -14,8 +14,14 @@ access is denied for ordinary commands.
 ```sh
 cargo build --release
 
-# Run one persistent MCP server (for example through a tunnel):
+# Run one persistent MCP server over stdin/stdout (for example through a tunnel):
 local-mcp mcp
+
+# Or expose the same server over Streamable HTTP (POST /mcp):
+local-mcp mcp-http
+
+# Choose another listen address when needed:
+local-mcp mcp-http --bind 127.0.0.1:8080
 
 # In another terminal, start a session in the project directory:
 cd ./some-project
@@ -56,9 +62,14 @@ the approvals process before every call. `/permissions yolo` disables those
 prompts only for the lifetime of that session; `/permissions ask`
 turns prompts back on. The singular `/permission ...` spelling is also accepted.
 Every tool takes a `session_id`. The agent can call `session_info` with the ID
-from the prompt to confirm the working directory and sandbox roots. One
-`local-mcp mcp` process can therefore serve multiple independently configured
-sessions.
+from the prompt to confirm the working directory and sandbox roots. One MCP
+server process can therefore serve multiple independently configured sessions.
+`local-mcp mcp` uses stdin/stdout, while `local-mcp mcp-http` serves the stateless
+Streamable HTTP JSON response transport at `http://127.0.0.1:3000/mcp` by default.
+HTTP notifications receive `202 Accepted`. The HTTP server has no authentication,
+so it binds only to loopback by default; add authentication in a trusted reverse
+proxy before exposing it to other machines. Browser requests with an `Origin`
+header are accepted only for `localhost`, `127.0.0.1`, and `::1` origins.
 `get_image` returns PNG, JPEG, GIF, WebP, BMP, TIFF, and AVIF files as native MCP
 image content. Relative image paths are resolved from the session working directory.
 

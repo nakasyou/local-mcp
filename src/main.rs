@@ -5,6 +5,7 @@ mod sandbox;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::net::SocketAddr;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -22,6 +23,12 @@ enum Command {
     },
     /// Run the session-independent MCP server over stdin/stdout.
     Mcp,
+    /// Run the session-independent MCP server over Streamable HTTP.
+    McpHttp {
+        /// Address on which to listen. Defaults to loopback for safety.
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        bind: SocketAddr,
+    },
 }
 
 #[tokio::main]
@@ -30,5 +37,6 @@ async fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Start { session_id: None }) {
         Command::Start { session_id } => approvals::start(session_id.as_deref()).await,
         Command::Mcp => mcp::serve().await,
+        Command::McpHttp { bind } => mcp::serve_http(bind).await,
     }
 }

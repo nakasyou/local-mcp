@@ -11,6 +11,7 @@ jobs = 4
 
 [dependencies]
 anyhow = "1"
+axum = "0.8"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 codex-linux-sandbox = { git = "https://github.com/openai/codex", rev = "20fedafff83f5c681fc62f73b0ca3227e42e3f8b" }
