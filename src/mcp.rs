@@ -84,14 +84,27 @@ async fn dispatch(request: &Value) -> Result<Value> {
 }
 
 fn tools() -> Value {
+    #[cfg(not(windows))]
+    let write_file_description = "Write a UTF-8 file in the Codex sandbox. Relative paths use the session working directory.";
+    #[cfg(windows)]
+    let write_file_description = "Write a UTF-8 file directly on the Windows host without a Codex sandbox. Relative paths use the session working directory.";
+    #[cfg(not(windows))]
+    let execute_description = "Execute argv without a shell in the Codex sandbox. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. Network is disabled and approval is not required.";
+    #[cfg(windows)]
+    let execute_description = "Execute argv without a shell directly on the Windows host. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. This has the user's filesystem and network access and requires approval unless the session is in yolo mode.";
+    #[cfg(not(windows))]
+    let start_command_description = "Start argv immediately as a background job in the Codex sandbox and return a job_id without waiting for completion. Network is disabled and approval is not required.";
+    #[cfg(windows)]
+    let start_command_description = "Start argv immediately as a background job directly on the Windows host and return a job_id without waiting for completion. This has the user's filesystem and network access and requires approval unless the session is in yolo mode.";
+
     let mut tools = json!([
         {"name":"session_info","description":"Show a local-mcp session's ID, working directory, and allowed sandbox roots.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"read_file","description":"Read a UTF-8 file from the local machine. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"}},"required":["session_id","path"]}},
         {"name":"get_image","description":"Read a local image and return it as MCP image content. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"list_directory","description":"List entries in a local directory. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"}},"required":["session_id","path"]}},
-        {"name":"write_file","description":"Write a UTF-8 file in the Codex sandbox. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"]}},
-        {"name":"execute","description":"Execute argv without a shell in the Codex sandbox. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. Network is disabled and approval is not required.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
-        {"name":"start_command","description":"Start argv immediately as a background job in the Codex sandbox and return a job_id without waiting for completion. Network is disabled and approval is not required.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
+        {"name":"write_file","description":write_file_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"]}},
+        {"name":"execute","description":execute_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
+        {"name":"start_command","description":start_command_description,"inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
         {"name":"poll_job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"stop_job","description":"Stop a background command returned by execute or start_command.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}}
@@ -294,20 +307,34 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
     let previous = tokio::fs::read_to_string(&absolute)
         .await
         .unwrap_or_default();
-    let command = vec![
-        "sh".to_owned(),
-        "-c".to_owned(),
-        "cat > \"$1\"".to_owned(),
-        "local-mcp-write".to_owned(),
-        absolute.display().to_string(),
-    ];
-    let output = sandbox::run(
-        &command,
-        &parent,
-        &[parent.clone()],
-        Some(content.as_bytes()),
-    )
-    .await?;
+    #[cfg(unix)]
+    let output = {
+        let command = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "cat > \"$1\"".to_owned(),
+            "local-mcp-write".to_owned(),
+            absolute.display().to_string(),
+        ];
+        sandbox::run(
+            &command,
+            &parent,
+            std::slice::from_ref(&parent),
+            Some(content.as_bytes()),
+        )
+        .await?
+    };
+    #[cfg(windows)]
+    let output = {
+        // Windows has no application sandbox here, so avoid depending on a
+        // shell utility for the file-edit operation.
+        tokio::fs::write(&absolute, content).await?;
+        sandbox::Output {
+            status: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    };
     let result = render_output(output);
     let (added, removed, diff) = render_diff(&previous, content);
     let title = format!(
@@ -323,7 +350,7 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
 }
 
 async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
-    let (rendered_command, mut handle) = spawn_sandboxed_command(args, session).await?;
+    let (rendered_command, mut handle) = spawn_sandboxed_command("execute", args, session).await?;
 
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
         Ok(joined) => text_result(joined.context("command task failed")??),
@@ -332,16 +359,31 @@ async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
 }
 
 async fn start_command(args: &Value, session: &config::Session) -> Result<Value> {
-    let (rendered_command, handle) = spawn_sandboxed_command(args, session).await?;
+    let (rendered_command, handle) =
+        spawn_sandboxed_command("start_command", args, session).await?;
     store_job(session, rendered_command, handle, "Started").await
 }
 
 async fn spawn_sandboxed_command(
+    operation: &str,
     args: &Value,
     session: &config::Session,
 ) -> Result<(String, JoinHandle<Result<String>>)> {
     let command = required_command(args)?;
     let cwd = cwd(args, &session.cwd)?;
+    #[cfg(windows)]
+    if !approvals::request(
+        &session.id,
+        operation,
+        format!("argv: {command:?}"),
+        cwd.clone(),
+    )
+    .await?
+    {
+        anyhow::bail!("user denied {operation}")
+    }
+    #[cfg(not(windows))]
+    let _ = operation;
     let mut roots = session.permitted_directories.clone();
     if !roots.iter().any(|root| cwd.starts_with(root)) {
         roots.push(cwd.clone());
@@ -587,6 +629,36 @@ mod tests {
     fn quotes_command_arguments_for_activity_display() {
         assert_eq!(shell_word("README.md"), "README.md");
         assert_eq!(shell_word("hello world"), "\"hello world\"");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn describes_windows_command_execution_as_approved_host_access() {
+        let tools = tools();
+        for name in ["execute", "start_command"] {
+            let description = tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap()["description"]
+                .as_str()
+                .unwrap();
+            assert!(description.contains("Windows host"));
+            assert!(description.contains("requires approval"));
+            assert!(description.contains("filesystem and network access"));
+        }
+
+        let write_file_description = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "write_file")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap();
+        assert!(write_file_description.contains("Windows host"));
+        assert!(write_file_description.contains("without a Codex sandbox"));
     }
 
     #[tokio::test]
