@@ -128,6 +128,15 @@ pub async fn run_unrestricted(
     cwd: &Path,
     stdin: Option<&[u8]>,
 ) -> Result<Output> {
+    run_unrestricted_with_env(command, cwd, stdin, &[]).await
+}
+
+pub async fn run_unrestricted_with_env(
+    command: &[String],
+    cwd: &Path,
+    stdin: Option<&[u8]>,
+    environment: &[(String, String)],
+) -> Result<Output> {
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
     let cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
@@ -136,6 +145,7 @@ pub async fn run_unrestricted(
         .kill_on_drop(true)
         .args(&command[1..])
         .current_dir(cwd)
+        .envs(environment.iter().map(|(key, value)| (key, value)))
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -168,6 +178,32 @@ fn safe_environment() -> HashMap<String, String> {
                 .map(|value| (name.to_owned(), value))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod unrestricted_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unrestricted_command_receives_environment_overrides() {
+        let command = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf %s \"$LOCAL_MCP_SUBAGENT_TEST\"".to_owned(),
+        ];
+        let environment = vec![("LOCAL_MCP_SUBAGENT_TEST".to_owned(), "injected".to_owned())];
+        let output = run_unrestricted_with_env(
+            &command,
+            &std::env::current_dir().unwrap(),
+            None,
+            &environment,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout, "injected");
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
