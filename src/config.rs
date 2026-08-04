@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -10,6 +11,17 @@ pub struct Session {
     pub cwd: PathBuf,
     #[serde(default)]
     pub permitted_directories: Vec<PathBuf>,
+    #[serde(default)]
+    pub subagent_providers: BTreeMap<String, SubagentProvider>,
+    #[serde(default)]
+    pub default_subagent_provider: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SubagentProvider {
+    pub driver: String,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 pub fn state_dir() -> Result<PathBuf> {
@@ -47,10 +59,20 @@ pub async fn create_session(cwd: &Path, id: Option<&str>) -> Result<Session> {
         .map(str::to_owned)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     validate_session_id(&id)?;
+    let previous = if tokio::fs::try_exists(session_path(&id)?).await? {
+        Some(load_session(&id).await?)
+    } else {
+        None
+    };
     let session = Session {
         id,
         cwd: cwd.clone(),
         permitted_directories: vec![cwd],
+        subagent_providers: previous
+            .as_ref()
+            .map(|session| session.subagent_providers.clone())
+            .unwrap_or_default(),
+        default_subagent_provider: previous.and_then(|session| session.default_subagent_provider),
     };
     save_session(&session).await?;
     Ok(session)
@@ -85,6 +107,17 @@ pub fn validate_session_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_provider_name(name: &str) -> Result<()> {
+    anyhow::ensure!(!name.is_empty(), "provider name must not be empty");
+    anyhow::ensure!(name.len() <= 64, "provider name must be at most 64 bytes");
+    anyhow::ensure!(
+        name.chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character)),
+        "provider name may contain only ASCII letters, numbers, '-' and '_'"
+    );
+    Ok(())
+}
+
 pub fn canonical_directory(path: &Path) -> Result<PathBuf> {
     let path = std::fs::canonicalize(path)
         .with_context(|| format!("cannot resolve {}", path.display()))?;
@@ -103,6 +136,27 @@ mod tests {
         assert!(validate_session_id("../escape").is_err());
         assert!(validate_session_id("contains spaces").is_err());
         assert!(validate_session_id(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn validates_provider_names() {
+        assert!(validate_provider_name("fast_opencode").is_ok());
+        assert!(validate_provider_name("claude-review").is_ok());
+        assert!(validate_provider_name("has spaces").is_err());
+        assert!(validate_provider_name("../escape").is_err());
+    }
+
+    #[test]
+    fn loads_sessions_created_before_provider_configuration() {
+        let session: Session = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "cwd": "/tmp",
+            "permitted_directories": ["/tmp"]
+        }))
+        .unwrap();
+
+        assert!(session.subagent_providers.is_empty());
+        assert!(session.default_subagent_provider.is_none());
     }
 
     #[test]

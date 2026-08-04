@@ -10,6 +10,7 @@ use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
 
 use crate::config::{self, Session};
+use crate::subagents;
 
 #[derive(Serialize, Deserialize)]
 pub struct Request {
@@ -98,7 +99,7 @@ pub async fn start(session_id: Option<&str>) -> Result<()> {
     eprintln!(
         "local-mcp session: {}\ncwd: {}\n\
          Give this session ID to the agent so it can include it in local-mcp tool calls.\n\
-         Commands: /permission ask|yolo|allow <directory>|revoke <directory>|list|status\n\
+         Commands: /permission help, /provider help\n\
          Press Ctrl-C to stop.",
         session.id,
         session.cwd.display()
@@ -128,7 +129,9 @@ pub async fn start(session_id: Option<&str>) -> Result<()> {
             }
             line = input.next_line() => {
                 let Some(line) = line? else { anyhow::bail!("session input closed") };
-                handle_input(line.trim(), &mut session, &mut yolo, &mut pending).await?;
+                if let Err(error) = handle_input(line.trim(), &mut session, &mut yolo, &mut pending).await {
+                    eprintln!("Command failed: {error:#}");
+                }
             }
         }
     }
@@ -210,6 +213,64 @@ async fn handle_input(
                 eprintln!("Revoked sandbox root: {}", directory.display());
             }
         }
+        command if provider_args(command, "add").is_some() => {
+            let values = provider_args(command, "add").unwrap();
+            anyhow::ensure!(
+                (2..=3).contains(&values.len()),
+                "usage: /provider add <name> <opencode|codex|claude|gemini> [model]"
+            );
+            let name = values[0];
+            let driver = values[1];
+            config::validate_provider_name(name)?;
+            anyhow::ensure!(
+                matches!(driver, "opencode" | "codex" | "claude" | "gemini"),
+                "unsupported provider driver: {driver}"
+            );
+            let provider = config::SubagentProvider {
+                driver: driver.to_owned(),
+                model: values.get(2).map(|value| (*value).to_owned()),
+            };
+            session.subagent_providers.insert(name.to_owned(), provider);
+            if session.default_subagent_provider.is_none() {
+                session.default_subagent_provider = Some(name.to_owned());
+            }
+            config::save_session(session).await?;
+            eprintln!("Configured provider: {name} ({driver})");
+        }
+        command if provider_args(command, "remove").is_some() => {
+            let values = provider_args(command, "remove").unwrap();
+            anyhow::ensure!(values.len() == 1, "usage: /provider remove <name>");
+            let name = values[0];
+            anyhow::ensure!(
+                session.subagent_providers.remove(name).is_some(),
+                "unknown provider: {name}"
+            );
+            if session.default_subagent_provider.as_deref() == Some(name) {
+                session.default_subagent_provider =
+                    session.subagent_providers.keys().next().cloned();
+            }
+            config::save_session(session).await?;
+            eprintln!("Removed provider: {name}");
+        }
+        command if provider_args(command, "default").is_some() => {
+            let values = provider_args(command, "default").unwrap();
+            anyhow::ensure!(values.len() == 1, "usage: /provider default <name>");
+            let name = values[0];
+            anyhow::ensure!(
+                session.subagent_providers.contains_key(name),
+                "unknown provider: {name}"
+            );
+            session.default_subagent_provider = Some(name.to_owned());
+            config::save_session(session).await?;
+            eprintln!("Default provider: {name}");
+        }
+        "/provider list" | "/providers list" | "/provider status" | "/providers status" => {
+            show_providers(session)
+        }
+        "/provider" | "/providers" | "/provider help" | "/providers help" => {
+            eprintln!("/provider add <name> <opencode|codex|claude|gemini> [model]");
+            eprintln!("/provider default <name> | remove <name> | list");
+        }
         "/permission" | "/permissions" | "/permission help" | "/permissions help" => {
             eprintln!("/permission ask|yolo|allow <directory>|revoke <directory>|list|status");
         }
@@ -236,10 +297,43 @@ fn permission_arg<'a>(command: &'a str, action: &str) -> Option<&'a str> {
         })
 }
 
+fn provider_args<'a>(command: &'a str, action: &str) -> Option<Vec<&'a str>> {
+    ["/provider", "/providers"].into_iter().find_map(|prefix| {
+        command
+            .strip_prefix(&format!("{prefix} {action} "))
+            .map(str::split_whitespace)
+            .map(Iterator::collect)
+    })
+}
+
 fn show_permissions(session: &Session) {
     eprintln!("Sandbox roots:");
     for path in &session.permitted_directories {
         eprintln!("  {}", path.display());
+    }
+}
+
+fn show_providers(session: &Session) {
+    eprintln!("Subagent providers:");
+    if session.subagent_providers.is_empty() {
+        eprintln!("  (none; use /provider add)");
+    }
+    for (name, provider) in &session.subagent_providers {
+        let marker = if session.default_subagent_provider.as_deref() == Some(name) {
+            " (default)"
+        } else {
+            ""
+        };
+        let model = provider.model.as_deref().unwrap_or("provider default");
+        let availability = if subagents::driver_available(&provider.driver) {
+            "installed"
+        } else {
+            "missing"
+        };
+        eprintln!(
+            "  {name}: {} / {model} [{availability}]{marker}",
+            provider.driver
+        );
     }
 }
 
@@ -261,4 +355,22 @@ fn show_next(pending: &VecDeque<(Request, UnixStream)>) -> Result<()> {
         show_request(request)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_provider_management_commands() {
+        assert_eq!(
+            provider_args("/provider add fast opencode openai/gpt", "add"),
+            Some(vec!["fast", "opencode", "openai/gpt"])
+        );
+        assert_eq!(
+            provider_args("/providers default fast", "default"),
+            Some(vec!["fast"])
+        );
+        assert_eq!(provider_args("/permission list", "add"), None);
+    }
 }

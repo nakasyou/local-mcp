@@ -2,8 +2,8 @@
 
 `local-mcp` exposes basic local-machine capabilities as MCP tools: file reads,
 image reads, directory listings, sandboxed file writes and commands, plus explicitly approved
-unsandboxed command execution. It intentionally does not provide web search or a
-dedicated network-request tool.
+unsandboxed command execution and read-only CLI subagents. It intentionally does not provide
+a built-in web search or dedicated network-request tool.
 
 Commands are isolated with OpenAI Codex's `codex-rs/sandboxing`: Landlock and the
 Linux sandbox helper on Linux, and Seatbelt (`sandbox-exec`) on macOS. Network
@@ -74,6 +74,47 @@ Longer commands continue in the background and return a `job_id`; use `poll_job`
 to check for completion or `stop_job` to terminate them. Use `start_command`
 when a command should run in the background immediately without the 30-second
 foreground wait.
+
+## CLI subagents
+
+Subagents follow Codex's thread-oriented multi-agent shape: `spawn_agent` starts
+a named task, `send_message` queues context, `followup_task` triggers another turn,
+`wait_agent` waits for completion, `list_agents` returns status and results, and
+`close_agent` releases a thread. Follow-up turns receive the recent transcript so
+they preserve the delegated task's context across separate CLI invocations.
+
+Providers are not enabled by the server. Configure the providers a session may use
+from the `local-mcp start` screen, similarly to permission management:
+
+```text
+/provider add fast opencode anthropic/claude-sonnet-4-5
+/provider add reviewer claude sonnet
+/provider add codex_readonly codex
+/provider default fast
+/provider list
+/provider remove reviewer
+```
+
+The first provider becomes the default automatically. A later `spawn_agent` can
+select one of these names with `agent_type`, or omit it to use the default. Provider
+configuration is saved with a stable session ID and restored on the next
+`local-mcp start <session-id>`. Each provider executable must be installed in the
+MCP server's `PATH` and authenticated using that CLI's normal setup.
+
+| Provider | Command | Safety mode | Optional `model` value |
+| --- | --- | --- | --- |
+| OpenCode | `opencode run` | pure plan agent with write/shell/MCP denied | `provider/model` |
+| Codex | `codex exec` | `--sandbox read-only` | Codex model name |
+| Claude Code | `claude --print` | safe plan mode with read-only built-ins | Claude model name or alias |
+| Gemini CLI | `gemini --prompt` | `--approval-mode plan` | Gemini model name |
+
+The task message is sent to the selected external provider. Spawning a thread runs
+on the host with network access and the CLI's existing credentials, so local-mcp
+requests explicit approval unless the session is in yolo mode. That permission is
+inherited by follow-up turns on the same thread, matching Codex's subagent model.
+Subagents are started in read-only or plan mode and return advice instead of
+modifying the workspace. Close agents when their work is no longer needed; each
+local-mcp session can keep up to four agent threads open concurrently.
 
 On Linux, the build produces `local-mcp` and its sibling `codex-linux-sandbox`;
 install or copy both into the same directory, and ensure `bwrap` (bubblewrap) is

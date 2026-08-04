@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::{approvals, config, sandbox};
+use crate::{approvals, config, sandbox, subagents};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -74,7 +74,7 @@ async fn dispatch(request: &Value) -> Result<Value> {
             "protocolVersion": "2025-06-18",
             "capabilities": {"tools": {"listChanged": false}},
             "serverInfo": {"name": "local-mcp", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Every tool call requires the local-mcp session_id supplied by the user. Call session_info with that ID to inspect its working directory and sandbox roots."
+            "instructions": "Every tool call requires the local-mcp session_id supplied by the user. Call session_info with that ID to inspect its working directory, sandbox roots, and user-configured subagent providers. Subagent tools follow Codex's task-thread lifecycle: spawn_agent, send_message/followup_task, wait_agent/list_agents, then close_agent."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
@@ -85,13 +85,19 @@ async fn dispatch(request: &Value) -> Result<Value> {
 
 fn tools() -> Value {
     let mut tools = json!([
-        {"name":"session_info","description":"Show a local-mcp session's ID, working directory, and allowed sandbox roots.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"session_info","description":"Show a local-mcp session's ID, working directory, allowed sandbox roots, and configured subagent providers.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"read_file","description":"Read a UTF-8 file from the local machine. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"}},"required":["session_id","path"]}},
         {"name":"get_image","description":"Read a local image and return it as MCP image content. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"list_directory","description":"List entries in a local directory. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"}},"required":["session_id","path"]}},
         {"name":"write_file","description":"Write a UTF-8 file in the Codex sandbox. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"]}},
         {"name":"execute","description":"Execute argv without a shell in the Codex sandbox. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. Network is disabled and approval is not required.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
         {"name":"start_command","description":"Start argv immediately as a background job in the Codex sandbox and return a job_id without waiting for completion. Network is disabled and approval is not required.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
+        {"name":"spawn_agent","description":"Spawn a configured CLI subagent for an independent task. The agent_type selects a provider configured by the user with /provider; omit it to use the default. Returns immediately with a canonical task name. The provider runs in read-only/plan mode with host network access and requires approval.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"task_name":{"type":"string","pattern":"^[a-z0-9_]+$"},"message":{"type":"string","minLength":1},"agent_type":{"type":"string","description":"Configured provider name from /provider list."},"cwd":{"type":"string"}},"required":["session_id","task_name","message"],"additionalProperties":false}},
+        {"name":"send_message","description":"Queue a message on an existing agent without triggering a new turn.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"target":{"type":"string"},"message":{"type":"string","minLength":1}},"required":["session_id","target","message"],"additionalProperties":false}},
+        {"name":"followup_task","description":"Send a follow-up message to an existing agent and trigger its next turn. If it is running, the message is queued for the next turn.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"target":{"type":"string"},"message":{"type":"string","minLength":1}},"required":["session_id","target","message"],"additionalProperties":false}},
+        {"name":"wait_agent","description":"Wait for any live agent to finish a turn. Returns a short update summary; use list_agents to inspect final content.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"timeout_ms":{"type":"integer","minimum":10000,"maximum":3600000}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"list_agents","description":"List live agents, their configured provider type, status, and latest task message.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"close_agent","description":"Close an agent when it is no longer needed and return its previous status.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"target":{"type":"string"}},"required":["session_id","target"],"additionalProperties":false}},
         {"name":"poll_job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"stop_job","description":"Stop a background command returned by execute or start_command.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}}
@@ -161,6 +167,22 @@ async fn call_tool(params: &Value) -> Result<Value> {
         "write_file" => write_file(&args, &session).await,
         "execute" => execute(&args, &session).await,
         "start_command" => start_command(&args, &session).await,
+        "spawn_agent" => text_result(serde_json::to_string(
+            &subagents::spawn(&session, &args).await?,
+        )?),
+        "send_message" => text_result(serde_json::to_string(
+            &subagents::send_message(&session, &args, false).await?,
+        )?),
+        "followup_task" => text_result(serde_json::to_string(
+            &subagents::send_message(&session, &args, true).await?,
+        )?),
+        "wait_agent" => text_result(serde_json::to_string(
+            &subagents::wait(&session, &args).await?,
+        )?),
+        "list_agents" => text_result(serde_json::to_string(&subagents::list(&session).await?)?),
+        "close_agent" => text_result(serde_json::to_string(
+            &subagents::close(&session, &args).await?,
+        )?),
         "poll_job" => poll_job(&args, &session).await,
         "stop_job" => stop_job(&args, &session).await,
         "without_sandbox" => without_sandbox(&args, &session).await,
@@ -587,6 +609,28 @@ mod tests {
     fn quotes_command_arguments_for_activity_display() {
         assert_eq!(shell_word("README.md"), "README.md");
         assert_eq!(shell_word("hello world"), "\"hello world\"");
+    }
+
+    #[test]
+    fn exposes_codex_style_subagent_lifecycle() {
+        let tools = tools();
+        let names = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        for name in [
+            "spawn_agent",
+            "send_message",
+            "followup_task",
+            "wait_agent",
+            "list_agents",
+            "close_agent",
+        ] {
+            assert!(names.contains(&name));
+        }
+        assert!(!names.contains(&"call_subagent"));
     }
 
     #[tokio::test]
