@@ -1,19 +1,29 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use axum::body::Bytes;
+use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Router, extract::State};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use reqwest::Client;
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
+use url::Url;
 use uuid::Uuid;
 
 use crate::{approvals, config, sandbox};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
+const PROTOCOL_VERSION: &str = "2025-06-18";
 
 struct Job {
     session_id: String,
@@ -40,19 +50,357 @@ pub async fn serve() -> Result<()> {
                 continue;
             }
         };
-        if request.get("id").is_none() {
-            continue;
+        if let Some(response) = handle_request(&request).await {
+            write_message(&mut stdout, &response).await?;
         }
-        let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let response = match dispatch(&request).await {
-            Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
-            Err(error) => {
-                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":format!("{error:#}")}})
-            }
-        };
-        write_message(&mut stdout, &response).await?;
     }
     Ok(())
+}
+
+#[derive(Clone)]
+struct HttpState {
+    auth: HttpAuth,
+}
+
+#[derive(Clone)]
+enum HttpAuth {
+    Disabled,
+    Static(Arc<str>),
+    OAuth(Arc<OAuthVerifier>),
+}
+
+pub struct OAuthConfig {
+    pub issuer: Url,
+    pub resource: Url,
+    pub introspection_endpoint: Url,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+}
+
+struct OAuthVerifier {
+    config: OAuthConfig,
+    resource_metadata: Url,
+    client: Client,
+}
+
+pub async fn serve_http(
+    bind: SocketAddr,
+    bearer_token: Option<String>,
+    oauth: Option<OAuthConfig>,
+) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("failed to bind HTTP server to {bind}"))?;
+    let auth = match (bearer_token, oauth) {
+        (Some(token), None) => HttpAuth::Static(Arc::from(token)),
+        (None, Some(config)) => {
+            validate_oauth_config(&config)?;
+            let resource_metadata = protected_resource_metadata_url(&config.resource)?;
+            let client = Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .context("failed to build OAuth introspection client")?;
+            HttpAuth::OAuth(Arc::new(OAuthVerifier {
+                config,
+                resource_metadata,
+                client,
+            }))
+        }
+        (None, None) => HttpAuth::Disabled,
+        (Some(_), Some(_)) => unreachable!("authentication modes conflict in clap"),
+    };
+    let state = HttpState { auth };
+    let authentication = match &state.auth {
+        HttpAuth::Disabled => "authentication disabled",
+        HttpAuth::Static(_) => "static Bearer authentication required",
+        HttpAuth::OAuth(_) => "OAuth 2.0 authentication required",
+    };
+    eprintln!("local-mcp HTTP server listening on http://{bind}/mcp ({authentication})");
+    axum::serve(listener, http_router(state))
+        .await
+        .context("HTTP server failed")
+}
+
+fn http_router(state: HttpState) -> Router {
+    Router::new()
+        .route("/mcp", post(http_post).get(http_get).delete(http_get))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth_protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/{*resource_path}",
+            get(oauth_protected_resource),
+        )
+        .with_state(state)
+}
+
+async fn http_get(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    if !authenticate(&headers, &state.auth).await {
+        return unauthorized_response(&state.auth);
+    }
+    if !has_valid_origin(&headers) {
+        return (StatusCode::FORBIDDEN, "Origin is not allowed").into_response();
+    }
+    StatusCode::METHOD_NOT_ALLOWED.into_response()
+}
+
+async fn http_post(State(state): State<HttpState>, headers: HeaderMap, body: Bytes) -> Response {
+    if !authenticate(&headers, &state.auth).await {
+        return unauthorized_response(&state.auth);
+    }
+    if !has_valid_origin(&headers) {
+        return (StatusCode::FORBIDDEN, "Origin is not allowed").into_response();
+    }
+    if !is_json_content_type(&headers) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type must be application/json",
+        )
+            .into_response();
+    }
+            "Accept must include application/json",
+            .into_response();
+    }
+
+    let request: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {"code": -32700, "message": error.to_string()}
+            }));
+        }
+    };
+    if !has_supported_protocol_version(&headers, &request) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("unsupported MCP-Protocol-Version; expected {PROTOCOL_VERSION}"),
+        )
+            .into_response();
+    }
+    match handle_request(&request).await {
+        Some(response) => json_response(response),
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let (scheme, token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))?;
+    scheme.eq_ignore_ascii_case("Bearer").then_some(token)
+}
+
+async fn authenticate(headers: &HeaderMap, auth: &HttpAuth) -> bool {
+    match auth {
+        HttpAuth::Disabled => true,
+        HttpAuth::Static(expected) => bearer_token(headers)
+            .is_some_and(|token| bool::from(token.as_bytes().ct_eq(expected.as_bytes()))),
+        HttpAuth::OAuth(verifier) => {
+            let Some(token) = bearer_token(headers) else {
+                return false;
+            };
+            match verifier.introspect(token).await {
+                Ok(valid) => valid,
+                Err(error) => {
+                    eprintln!("OAuth token introspection failed: {error:#}");
+                    false
+                }
+            }
+        }
+    }
+}
+
+impl OAuthVerifier {
+    async fn introspect(&self, token: &str) -> Result<bool> {
+        let mut request = self
+            .client
+            .post(self.config.introspection_endpoint.clone())
+            .form(&[("token", token), ("token_type_hint", "access_token")]);
+        if let Some(client_id) = self.config.client_id.as_deref() {
+            request = request.basic_auth(client_id, self.config.client_secret.as_deref());
+        }
+        let response = request
+            .send()
+            .await
+            .context("introspection request failed")?
+            .error_for_status()
+            .context("introspection endpoint returned an error")?;
+        let body: Value = response
+            .json()
+            .await
+            .context("invalid introspection response")?;
+        Ok(is_active_for_resource(
+            &body,
+            &self.config.issuer,
+            &self.config.resource,
+        ))
+    }
+}
+
+fn is_active_for_resource(body: &Value, issuer: &Url, resource: &Url) -> bool {
+    if body.get("active").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    if let Some(actual_issuer) = body.get("iss").and_then(Value::as_str)
+        && actual_issuer != issuer.as_str()
+    {
+        return false;
+    }
+    match body.get("aud") {
+        Some(Value::String(audience)) => audience == resource.as_str(),
+        Some(Value::Array(audiences)) => audiences
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|audience| audience == resource.as_str()),
+        _ => false,
+    }
+}
+
+fn validate_oauth_config(config: &OAuthConfig) -> Result<()> {
+    for (name, url) in [
+        ("OAuth issuer", &config.issuer),
+        ("OAuth resource", &config.resource),
+        (
+            "OAuth introspection endpoint",
+            &config.introspection_endpoint,
+        ),
+    ] {
+        ensure_http_url(name, url)?;
+    }
+    anyhow::ensure!(
+        config.client_secret.is_none() || config.client_id.is_some(),
+        "OAuth client secret requires a client ID"
+    );
+    Ok(())
+}
+
+fn ensure_http_url(name: &str, url: &Url) -> Result<()> {
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https") && url.host().is_some(),
+        "{name} must be an absolute HTTP(S) URL"
+    );
+    let is_loopback = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost") || matches!(host, "127.0.0.1" | "::1" | "[::1]")
+    });
+    anyhow::ensure!(
+        url.scheme() == "https" || is_loopback,
+        "{name} must use HTTPS unless it has a loopback host"
+    );
+    Ok(())
+}
+
+fn protected_resource_metadata_url(resource: &Url) -> Result<Url> {
+    let mut metadata = resource.clone();
+    metadata.set_query(None);
+    metadata.set_fragment(None);
+    let resource_path = resource.path().trim_start_matches('/');
+    let path = if resource_path.is_empty() {
+        "/.well-known/oauth-protected-resource".to_owned()
+    } else {
+        format!("/.well-known/oauth-protected-resource/{resource_path}")
+    };
+    metadata.set_path(&path);
+    Ok(metadata)
+}
+
+async fn oauth_protected_resource(State(state): State<HttpState>) -> Response {
+    let HttpAuth::OAuth(verifier) = &state.auth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    json_response(json!({
+        "resource": verifier.config.resource,
+        "authorization_servers": [verifier.config.issuer],
+        "bearer_methods_supported": ["header"]
+    }))
+}
+
+fn unauthorized_response(auth: &HttpAuth) -> Response {
+    let challenge = match auth {
+        HttpAuth::OAuth(verifier) => format!(
+            "Bearer resource_metadata=\"{}\"",
+            verifier.resource_metadata
+        ),
+        _ => "Bearer".to_owned(),
+    };
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, challenge)],
+        "Bearer token is missing or invalid",
+    )
+        .into_response()
+}
+
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+}
+
+fn has_valid_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    origin
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<Uri>().ok())
+        .and_then(|uri| uri.host().map(str::to_owned))
+        .is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || matches!(host.as_str(), "127.0.0.1" | "::1" | "[::1]")
+        })
+}
+
+fn has_supported_protocol_version(headers: &HeaderMap, request: &Value) -> bool {
+    if request.get("method").and_then(Value::as_str) == Some("initialize") {
+        return true;
+    }
+    headers
+        .get("mcp-protocol-version")
+        .map(|value| value.as_bytes() == PROTOCOL_VERSION.as_bytes())
+        .unwrap_or(true)
+}
+
+fn accepts_json(headers: &HeaderMap) -> bool {
+    let Some(value) = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let accepts = |expected: &str| {
+        value.split(',').any(|item| {
+            item.trim()
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.eq_ignore_ascii_case(expected) || mime == "*/*")
+        })
+    };
+    accepts("application/json") && accepts("text/event-stream")
+}
+
+fn json_response(value: Value) -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        value.to_string(),
+    )
+        .into_response()
+}
+
+async fn handle_request(request: &Value) -> Option<Value> {
+    let id = request.get("id")?.clone();
+    Some(match dispatch(request).await {
+        Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
+        Err(error) => {
+            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":format!("{error:#}")}})
+        }
+    })
 }
 
 async fn write_message(stdout: &mut tokio::io::Stdout, message: &Value) -> Result<()> {
@@ -71,7 +419,7 @@ async fn dispatch(request: &Value) -> Result<Value> {
         .unwrap_or_default()
     {
         "initialize" => Ok(json!({
-            "protocolVersion": "2025-06-18",
+            "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": false}},
             "serverInfo": {"name": "local-mcp", "version": env!("CARGO_PKG_VERSION")},
             "instructions": "Every tool call requires the local-mcp session_id supplied by the user. Call session_info with that ID to inspect its working directory and sandbox roots."
@@ -606,6 +954,41 @@ fn render_output(output: sandbox::Output) -> Result<String> {
 mod tests {
     use super::*;
 
+    fn http_state(bearer_token: Option<&str>) -> State<HttpState> {
+        State(HttpState {
+            auth: bearer_token
+                .map(|token| HttpAuth::Static(Arc::from(token)))
+                .unwrap_or(HttpAuth::Disabled),
+        })
+    }
+
+    fn oauth_state(introspection_endpoint: Url) -> State<HttpState> {
+        let config = OAuthConfig {
+            issuer: Url::parse("https://auth.example.com").unwrap(),
+            resource: Url::parse("https://mcp.example.com/mcp").unwrap(),
+            introspection_endpoint,
+            client_id: Some("local-mcp".to_owned()),
+            client_secret: Some("introspection-secret".to_owned()),
+        };
+        State(HttpState {
+            auth: HttpAuth::OAuth(Arc::new(OAuthVerifier {
+                resource_metadata: protected_resource_metadata_url(&config.resource).unwrap(),
+                config,
+                client: Client::new(),
+            })),
+        })
+    }
+
+    fn http_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(
+            header::ACCEPT,
+            "application/json, text/event-stream".parse().unwrap(),
+        );
+        headers
+    }
+
     #[test]
     fn detects_supported_image_types() {
         assert_eq!(image_mime_type(b"\x89PNG\r\n\x1a\n"), Some("image/png"));
@@ -688,5 +1071,185 @@ mod tests {
         tokio::fs::remove_dir_all(directory).await.unwrap();
 
         assert_eq!(result["content"][0]["mimeType"], "image/gif");
+    }
+
+    #[tokio::test]
+    async fn http_returns_json_rpc_response() {
+        let response = http_post(
+            http_state(None),
+            http_headers(),
+            Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["id"], 1);
+        assert_eq!(body["result"]["serverInfo"]["name"], "local-mcp");
+    }
+
+    #[tokio::test]
+    async fn http_accepts_notifications_without_a_response_body() {
+        let response = http_post(
+            http_state(None),
+            http_headers(),
+            Bytes::from_static(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_rejects_invalid_headers() {
+        let response = http_post(
+            http_state(None),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let mut headers = http_headers();
+        headers.insert(header::ORIGIN, "https://example.com".parse().unwrap());
+        let response = http_post(http_state(None), headers, Bytes::from_static(b"{}")).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let mut headers = http_headers();
+        headers.insert("mcp-protocol-version", "unsupported".parse().unwrap());
+        let response = http_post(
+            http_state(None),
+            headers,
+            Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_get_reports_that_sse_is_not_available() {
+        let response = http_get(http_state(None), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, "https://example.com".parse().unwrap());
+        let response = http_get(http_state(None), headers).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn http_requires_configured_bearer_token() {
+        let response = http_post(
+            http_state(Some("secret-token")),
+            http_headers(),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
+
+        let mut headers = http_headers();
+        headers.insert(header::AUTHORIZATION, "Bearer wrong-token".parse().unwrap());
+        let response = http_post(
+            http_state(Some("secret-token")),
+            headers,
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let mut headers = http_headers();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer secret-token".parse().unwrap(),
+        );
+        let response = http_post(
+            http_state(Some("secret-token")),
+            headers,
+            Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn http_authenticates_get_requests_too() {
+        let response = http_get(http_state(Some("secret-token")), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "bearer secret-token".parse().unwrap(),
+        );
+        let response = http_get(http_state(Some("secret-token")), headers).await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn oauth_publishes_discovery_and_challenges() {
+        let state = oauth_state(Url::parse("https://auth.example.com/introspect").unwrap());
+        let _router = http_router(state.0.clone());
+
+        let metadata = oauth_protected_resource(state.clone()).await;
+        assert_eq!(metadata.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(metadata.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["resource"], "https://mcp.example.com/mcp");
+        assert_eq!(
+            body["authorization_servers"][0],
+            "https://auth.example.com/"
+        );
+
+        let response = http_post(state.clone(), http_headers(), Bytes::from_static(b"{}")).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers()[header::WWW_AUTHENTICATE],
+            "Bearer resource_metadata=\"https://mcp.example.com/.well-known/oauth-protected-resource/mcp\""
+        );
+    }
+
+    #[test]
+    fn oauth_accepts_only_active_audience_bound_tokens() {
+        let issuer = Url::parse("https://auth.example.com/").unwrap();
+        let resource = Url::parse("https://mcp.example.com/mcp").unwrap();
+        assert!(is_active_for_resource(
+            &json!({
+                "active": true,
+                "iss": issuer,
+                "aud": ["another-audience", resource]
+            }),
+            &issuer,
+            &resource
+        ));
+        assert!(!is_active_for_resource(
+            &json!({"active": false, "aud": resource}),
+            &issuer,
+            &resource
+        ));
+        assert!(!is_active_for_resource(
+            &json!({"active": true, "aud": "https://other.example.com/mcp"}),
+            &issuer,
+            &resource
+        ));
+    }
+
+    #[test]
+    fn oauth_metadata_url_follows_rfc_9728_path_insertion() {
+        let resource = Url::parse("https://mcp.example.com/public/mcp?ignored=yes").unwrap();
+        assert_eq!(
+            protected_resource_metadata_url(&resource).unwrap().as_str(),
+            "https://mcp.example.com/.well-known/oauth-protected-resource/public/mcp"
+        );
     }
 }
