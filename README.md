@@ -23,6 +23,23 @@ local-mcp mcp-http
 # Choose another listen address when needed:
 local-mcp mcp-http --bind 127.0.0.1:8080
 
+# Require Authorization: Bearer <token> on every HTTP request. Using the
+# environment variable avoids exposing the token in the process argument list:
+LOCAL_MCP_BEARER_TOKEN='replace-with-a-secret' local-mcp mcp-http
+
+# Or generate a fresh, cryptographically secure 256-bit token at startup:
+local-mcp mcp-http --generate-bearer-token
+
+# Protect a publicly reachable server with OAuth 2.0. The authorization server
+# must expose an RFC 7662 introspection endpoint whose active responses include
+# this MCP server's canonical URI in the `aud` claim:
+LOCAL_MCP_OAUTH_ISSUER='https://auth.example.com/' \
+LOCAL_MCP_OAUTH_RESOURCE='https://mcp.example.com/mcp' \
+LOCAL_MCP_OAUTH_INTROSPECTION_ENDPOINT='https://auth.example.com/oauth/introspect' \
+LOCAL_MCP_OAUTH_CLIENT_ID='local-mcp' \
+LOCAL_MCP_OAUTH_CLIENT_SECRET='replace-with-a-secret' \
+local-mcp mcp-http --bind 0.0.0.0:3000
+
 # In another terminal, start a session in the project directory:
 cd ./some-project
 local-mcp start
@@ -66,9 +83,25 @@ from the prompt to confirm the working directory and sandbox roots. One MCP
 server process can therefore serve multiple independently configured sessions.
 `local-mcp mcp` uses stdin/stdout, while `local-mcp mcp-http` serves the stateless
 Streamable HTTP JSON response transport at `http://127.0.0.1:3000/mcp` by default.
-HTTP notifications receive `202 Accepted`. The HTTP server has no authentication,
-so it binds only to loopback by default; add authentication in a trusted reverse
-proxy before exposing it to other machines. Browser requests with an `Origin`
+HTTP notifications receive `202 Accepted`. The HTTP server binds only to loopback
+by default. Set `LOCAL_MCP_BEARER_TOKEN` or pass `--bearer-token` to require an
+`Authorization: Bearer <token>` header on every HTTP request. Authentication is
+disabled when neither is set. Alternatively, `--generate-bearer-token` creates a
+URL-safe 256-bit token from the operating system's secure random source and prints
+it once at startup.
+
+For OAuth 2.0, configure `LOCAL_MCP_OAUTH_ISSUER`,
+`LOCAL_MCP_OAUTH_RESOURCE`, and `LOCAL_MCP_OAUTH_INTROSPECTION_ENDPOINT` together.
+The optional client ID and secret authenticate `local-mcp` to the introspection
+endpoint with HTTP Basic authentication. OAuth mode publishes RFC 9728 Protected
+Resource Metadata at `/.well-known/oauth-protected-resource` and the MCP
+path-specific well-known URI, and advertises that metadata in `401 Unauthorized`
+responses. Each access token is checked through RFC 7662; only active tokens whose
+`aud` field contains the exact configured resource URI are accepted. The
+authorization server itself remains a separate service and must provide OAuth 2.1
+authorization and metadata endpoints to MCP clients.
+
+Browser requests with an `Origin`
 header are accepted only for `localhost`, `127.0.0.1`, and `::1` origins.
 `get_image` returns PNG, JPEG, GIF, WebP, BMP, TIFF, and AVIF files as native MCP
 image content. Relative image paths are resolved from the session working directory.

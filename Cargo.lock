@@ -2289,12 +2289,16 @@ dependencies = [
  "codex-sandboxing",
  "codex-utils-absolute-path",
  "dirs",
+ "getrandom 0.3.4",
  "libc",
  "openssl",
+ "reqwest",
  "serde",
  "serde_json",
  "similar",
+ "subtle",
  "tokio",
+ "url",
  "uuid",
 ]
 
