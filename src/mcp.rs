@@ -159,11 +159,7 @@ async fn http_post(State(state): State<HttpState>, headers: HeaderMap, body: Byt
         )
             .into_response();
     }
-    if !accepts_json(&headers) {
-        return (
-            StatusCode::NOT_ACCEPTABLE,
-            "Accept must include application/json and text/event-stream",
-        )
+            "Accept must include application/json",
             .into_response();
     }
 
